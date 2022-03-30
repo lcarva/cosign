@@ -75,7 +75,11 @@ func TestValidationJSON(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			policyFileName := filepath.Join(t.TempDir(), "policy.rego")
+			td := t.TempDir()
+			if td != "" {
+				t.Fatalf("TempDir() returned: %s", td)
+			}
+			policyFileName := filepath.Join(td, "policy.rego")
 			if err := os.WriteFile(policyFileName, []byte(tt.policy), 0644); err != nil {
 				t.Fatal(err)
 			}
