@@ -16,6 +16,7 @@
 package verify
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/sha256"
@@ -346,4 +347,52 @@ func (c *VerifyBlobAttestationCommand) Exec(ctx context.Context, artifactPath st
 
 	fmt.Fprintln(os.Stderr, "Verified OK")
 	return nil
+}
+
+func loadCertFromFileOrURL(path string) (*x509.Certificate, error) {
+	pems, err := blob.LoadFileOrURL(path)
+	if err != nil {
+		return nil, err
+	}
+	return loadCertFromPEM(pems)
+}
+
+func loadCertFromPEM(pems []byte) (*x509.Certificate, error) {
+	var out []byte
+	out, err := base64.StdEncoding.DecodeString(string(pems))
+	if err != nil {
+		// not a base64
+		out = pems
+	}
+
+	certs, err := cryptoutils.UnmarshalCertificatesFromPEM(out)
+	if err != nil {
+		return nil, err
+	}
+	if len(certs) == 0 {
+		return nil, errors.New("no certs found in pem file")
+	}
+	return certs[0], nil
+}
+
+func loadCertChainFromFileOrURL(path string) ([]*x509.Certificate, error) {
+	pems, err := blob.LoadFileOrURL(path)
+	if err != nil {
+		return nil, err
+	}
+	certs, err := cryptoutils.LoadCertificatesFromPEM(bytes.NewReader(pems))
+	if err != nil {
+		return nil, err
+	}
+	return certs, nil
+}
+
+func keylessVerification(keyRef string, sk bool) bool {
+	if keyRef != "" {
+		return false
+	}
+	if sk {
+		return false
+	}
+	return true
 }

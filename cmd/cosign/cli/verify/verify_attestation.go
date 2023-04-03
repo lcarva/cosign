@@ -20,24 +20,17 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/sigstore/cosign/v2/cmd/cosign/cli/fulcio"
 	"github.com/sigstore/cosign/v2/cmd/cosign/cli/options"
-	"github.com/sigstore/cosign/v2/cmd/cosign/cli/rekor"
-	"github.com/sigstore/cosign/v2/internal/pkg/cosign/tsa"
 	"github.com/sigstore/cosign/v2/internal/ui"
 	"github.com/sigstore/cosign/v2/pkg/cosign"
 	"github.com/sigstore/cosign/v2/pkg/cosign/cue"
-	"github.com/sigstore/cosign/v2/pkg/cosign/pivkey"
-	"github.com/sigstore/cosign/v2/pkg/cosign/pkcs11key"
 	"github.com/sigstore/cosign/v2/pkg/cosign/rego"
 	"github.com/sigstore/cosign/v2/pkg/oci"
 	"github.com/sigstore/cosign/v2/pkg/policy"
-	sigs "github.com/sigstore/cosign/v2/pkg/signature"
 )
 
 // VerifyAttestationCommand verifies a signature on a supplied container image
@@ -58,15 +51,16 @@ type VerifyAttestationCommand struct {
 	SCTRef                       string
 	Sk                           bool
 	Slot                         string
-	Output                       string
-	RekorURL                     string
-	PredicateType                string
-	Policies                     []string
-	LocalImage                   bool
-	NameOptions                  []name.Option
-	Offline                      bool
-	TSACertChainPath             string
-	IgnoreTlog                   bool
+	// TODO: Where's this used?
+	Output           string
+	RekorURL         string
+	PredicateType    string
+	Policies         []string
+	LocalImage       bool
+	NameOptions      []name.Option
+	Offline          bool
+	TSACertChainPath string
+	IgnoreTlog       bool
 }
 
 // Exec runs the verification command
@@ -75,157 +69,39 @@ func (c *VerifyAttestationCommand) Exec(ctx context.Context, images []string) (e
 		return flag.ErrHelp
 	}
 
-	// We can't have both a key and a security key
-	if options.NOf(c.KeyRef, c.Sk) > 1 {
-		return &options.KeyParseError{}
-	}
-
-	var identities []cosign.Identity
-	if c.KeyRef == "" {
-		identities, err = c.Identities()
-		if err != nil {
-			return err
-		}
-	}
-
-	ociremoteOpts, err := c.ClientOpts(ctx)
-	if err != nil {
-		return fmt.Errorf("constructing client options: %w", err)
-	}
-
-	co := &cosign.CheckOpts{
-		RegistryClientOpts:           ociremoteOpts,
+	config := CheckConfig{
+		RegistryOptions:              c.RegistryOptions,
+		CertVerifyOptions:            c.CertVerifyOptions,
+		KeyRef:                       c.KeyRef,
+		CertRef:                      c.CertRef,
 		CertGithubWorkflowTrigger:    c.CertGithubWorkflowTrigger,
 		CertGithubWorkflowSha:        c.CertGithubWorkflowSha,
 		CertGithubWorkflowName:       c.CertGithubWorkflowName,
 		CertGithubWorkflowRepository: c.CertGithubWorkflowRepository,
 		CertGithubWorkflowRef:        c.CertGithubWorkflowRef,
+		CertChain:                    c.CertChain,
 		IgnoreSCT:                    c.IgnoreSCT,
-		Identities:                   identities,
+		SCTRef:                       c.SCTRef,
+		Sk:                           c.Sk,
+		Slot:                         c.Slot,
+		RekorURL:                     c.RekorURL,
 		Offline:                      c.Offline,
+		TSACertChainPath:             c.TSACertChainPath,
 		IgnoreTlog:                   c.IgnoreTlog,
 	}
+
+	config.SetDefaults()
+	if err := config.Validate(); err != nil {
+		return err
+	}
+
+	co, err := config.ToCheckOpts(ctx)
+	if err != nil {
+		return err
+	}
+
 	if c.CheckClaims {
 		co.ClaimVerifier = cosign.IntotoSubjectClaimVerifier
-	}
-	if !c.IgnoreSCT {
-		co.CTLogPubKeys, err = cosign.GetCTLogPubs(ctx)
-		if err != nil {
-			return fmt.Errorf("getting ctlog public keys: %w", err)
-		}
-	}
-
-	if c.TSACertChainPath != "" {
-		_, err := os.Stat(c.TSACertChainPath)
-		if err != nil {
-			return fmt.Errorf("unable to open timestamp certificate chain file '%s: %w", c.TSACertChainPath, err)
-		}
-		// TODO: Add support for TUF certificates.
-		pemBytes, err := os.ReadFile(filepath.Clean(c.TSACertChainPath))
-		if err != nil {
-			return fmt.Errorf("error reading certification chain path file: %w", err)
-		}
-
-		leaves, intermediates, roots, err := tsa.SplitPEMCertificateChain(pemBytes)
-		if err != nil {
-			return fmt.Errorf("error splitting certificates: %w", err)
-		}
-		if len(leaves) > 1 {
-			return fmt.Errorf("certificate chain must contain at most one TSA certificate")
-		}
-		if len(leaves) == 1 {
-			co.TSACertificate = leaves[0]
-		}
-		co.TSAIntermediateCertificates = intermediates
-		co.TSARootCertificates = roots
-	}
-	if !c.IgnoreTlog {
-		if c.RekorURL != "" {
-			rekorClient, err := rekor.NewClient(c.RekorURL)
-			if err != nil {
-				return fmt.Errorf("creating Rekor client: %w", err)
-			}
-			co.RekorClient = rekorClient
-		}
-		// This performs an online fetch of the Rekor public keys, but this is needed
-		// for verifying tlog entries (both online and offline).
-		co.RekorPubKeys, err = cosign.GetRekorPubs(ctx)
-		if err != nil {
-			return fmt.Errorf("getting Rekor public keys: %w", err)
-		}
-	}
-	if keylessVerification(c.KeyRef, c.Sk) {
-		// This performs an online fetch of the Fulcio roots. This is needed
-		// for verifying keyless certificates (both online and offline).
-		co.RootCerts, err = fulcio.GetRoots()
-		if err != nil {
-			return fmt.Errorf("getting Fulcio roots: %w", err)
-		}
-		co.IntermediateCerts, err = fulcio.GetIntermediates()
-		if err != nil {
-			return fmt.Errorf("getting Fulcio intermediates: %w", err)
-		}
-	}
-	keyRef := c.KeyRef
-
-	// Keys are optional!
-	switch {
-	case keyRef != "":
-		co.SigVerifier, err = sigs.PublicKeyFromKeyRef(ctx, keyRef)
-		if err != nil {
-			return fmt.Errorf("loading public key: %w", err)
-		}
-		pkcs11Key, ok := co.SigVerifier.(*pkcs11key.Key)
-		if ok {
-			defer pkcs11Key.Close()
-		}
-	case c.Sk:
-		sk, err := pivkey.GetKeyWithSlot(c.Slot)
-		if err != nil {
-			return fmt.Errorf("opening piv token: %w", err)
-		}
-		defer sk.Close()
-		co.SigVerifier, err = sk.Verifier()
-		if err != nil {
-			return fmt.Errorf("initializing piv token verifier: %w", err)
-		}
-	case c.CertRef != "":
-		cert, err := loadCertFromFileOrURL(c.CertRef)
-		if err != nil {
-			return fmt.Errorf("loading certificate from reference: %w", err)
-		}
-		if c.CertChain == "" {
-			// If no certChain is passed, the Fulcio root certificate will be used
-			co.RootCerts, err = fulcio.GetRoots()
-			if err != nil {
-				return fmt.Errorf("getting Fulcio roots: %w", err)
-			}
-			co.IntermediateCerts, err = fulcio.GetIntermediates()
-			if err != nil {
-				return fmt.Errorf("getting Fulcio intermediates: %w", err)
-			}
-			co.SigVerifier, err = cosign.ValidateAndUnpackCert(cert, co)
-			if err != nil {
-				return fmt.Errorf("creating certificate verifier: %w", err)
-			}
-		} else {
-			// Verify certificate with chain
-			chain, err := loadCertChainFromFileOrURL(c.CertChain)
-			if err != nil {
-				return err
-			}
-			co.SigVerifier, err = cosign.ValidateAndUnpackCertWithChain(cert, chain, co)
-			if err != nil {
-				return fmt.Errorf("creating certificate verifier: %w", err)
-			}
-		}
-		if c.SCTRef != "" {
-			sct, err := os.ReadFile(filepath.Clean(c.SCTRef))
-			if err != nil {
-				return fmt.Errorf("reading sct from file: %w", err)
-			}
-			co.SCT = sct
-		}
 	}
 
 	// NB: There are only 2 kinds of verification right now:
